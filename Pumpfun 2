@@ -1,0 +1,422 @@
+"""
+Pump.fun Sniper Bot (single-file, Jupiter swap + honeypot check + auto-sell)
+
+USAGE:
+ - Do NOT upload your real PRIVATE_KEY to a public repo.
+ - Best: keep this file on your machine and run from terminal.
+ - Test on devnet or with tiny amounts first.
+
+Dependencies:
+ pip install solana solders requests base58
+ (solana and solders versions must support VersionedTransaction.deserialize/sign)
+"""
+
+import asyncio
+import json
+import time
+import base64
+import requests
+from typing import Optional
+
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.websocket_api import connect as ws_connect
+from solana.publickey import PublicKey
+from solders.transaction import VersionedTransaction
+from solders.signature import Signature
+from solders.keypair import Keypair as SKeypair  # for solders signing serialization
+from solana.keypair import Keypair  # for convenience
+from solana.rpc.types import TxOpts
+
+# ----------------- CONFIG (Interactive prompt) -----------------
+print("===== Pump.fun Sniper Bot (REAL) =====")
+print("!! IMPORTANT: keep PRIVATE KEY local and secret. Do NOT push to public GitHub !!")
+PRIVATE_KEY = input("Enter your wallet PRIVATE KEY (base58 secret key): ").strip()
+PUBLIC_KEY = input("Enter your wallet PUBLIC KEY: ").strip()
+BUY_AMOUNT_SOL = float(input("Enter amount to invest per token (SOL) [e.g. 0.01]: ").strip() or "0.01")
+TAKE_PROFIT_PCT = float(input("Take Profit % (e.g. 20): ").strip() or "20")
+STOP_LOSS_PCT = float(input("Stop Loss % (e.g. 10): ").strip() or "10")
+MIN_LIQUIDITY_USD = float(input("Min liquidity (USD) to accept (e.g. 500): ").strip() or "500")
+SLIPPAGE_BPS = int(input("Slippage in bps (e.g. 50 for 0.5%): ").strip() or "50")
+DEVNET_MODE = input("Run on devnet? (y/N): ").strip().lower() == "y"
+
+# RPCs
+if DEVNET_MODE:
+    RPC_HTTP = "https://api.devnet.solana.com"
+    RPC_WS = "wss://api.devnet.solana.com/"
+else:
+    RPC_HTTP = "https://api.mainnet-beta.solana.com"
+    RPC_WS = "wss://api.mainnet-beta.solana.com/"
+
+# Pump.fun factory (example). Keep as-is.
+PUMP_FACTORY_ACCOUNT = PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+
+# Jupiter endpoints (v6 used here)
+JUPITER_QUOTE = "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP  = "https://quote-api.jup.ag/v6/swap"
+
+# helper wallets
+try:
+    # Try solana Keypair convenience
+    wallet = Keypair.from_base58_string(PRIVATE_KEY)
+    # also create solders Keypair for signing VersionedTransaction
+    # solders expects 64-byte secret key: Keypair secret may be 64 bytes base58 array or 32 bytes seed.
+    # We'll try to convert:
+    sk_bytes = wallet.seed or wallet.secret_key  # depending on solana version
+    # create SKeypair from secret bytes (works if 64/32 appropriate)
+    try:
+        solders_kp = SKeypair.from_secret_key(bytes(sk_bytes))
+    except Exception:
+        # fallback: try to decode base58 to bytes and use directly
+        import base58
+        try:
+            decoded = base58.b58decode(PRIVATE_KEY)
+            solders_kp = SKeypair.from_secret_key(decoded)
+        except Exception:
+            solders_kp = None
+except Exception:
+    print("Error loading private key into solana Keypair. Make sure you provided correct base58 secret key.")
+    raise
+
+# Utility: call Solana RPC (sync) via requests
+def solana_rpc(method: str, params: list):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = requests.post(RPC_HTTP, json=payload, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+# ----------------- Helpers: parse transaction to extract new mint -----------------
+def try_extract_mint_from_signature(signature: str) -> Optional[str]:
+    """
+    Best-effort: fetch transaction by signature and try to find 'initializeMint' or new mint addresses.
+    Returns mint pubkey string or None.
+    """
+    try:
+        res = solana_rpc("getTransaction", [signature, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+        if "result" not in res or res["result"] is None:
+            return None
+        tx = res["result"]
+        # Search instructions for "initializeMint" or token program calls
+        txn = tx.get("transaction", {})
+        message = txn.get("message", {})
+        instructions = message.get("instructions", [])
+        # Try parsed instructions
+        for ins in instructions:
+            parsed = ins.get("parsed")
+            program = ins.get("program")
+            if parsed and program == "spl-token":
+                # parsed value may contain "type": "initializeMint"
+                typ = parsed.get("type")
+                info = parsed.get("info", {})
+                if typ and "mint" in info:
+                    return info["mint"]
+        # Fallback: look into postTokenBalances for a mint that appears (new mint)
+        meta = tx.get("meta", {})
+        post = meta.get("postTokenBalances", []) or []
+        pre = meta.get("preTokenBalances", []) or []
+        # mints present post but not pre -> new token holding maybe
+        pre_mints = {p.get("mint") for p in pre}
+        for p in post:
+            m = p.get("mint")
+            if m and m not in pre_mints:
+                return m
+    except Exception as e:
+        print("extract_mint error:", e)
+    return None
+
+# ----------------- Honeypot / liquidity quick checks -----------------
+def get_token_decimals(mint: str) -> Optional[int]:
+    try:
+        r = solana_rpc("getTokenSupply", [mint])
+        if "result" in r and r["result"]:
+            val = r["result"]["value"]
+            # Some RPCs supply decimals inside same result
+            decimals = val.get("decimals")
+            if decimals is not None:
+                return int(decimals)
+    except Exception:
+        pass
+    # fallback unknown
+    return None
+
+def jupiter_quote(input_mint: str, output_mint: str, amount_raw: int, slippage_bps: int = SLIPPAGE_BPS):
+    try:
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": amount_raw,
+            "slippageBps": slippage_bps
+        }
+        r = requests.get(JUPITER_QUOTE, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            return None
+    except Exception as e:
+        print("jupiter quote error:", e)
+        return None
+
+def honeypot_and_liquidity_check(token_mint: str) -> bool:
+    """
+    Basic checks:
+     - Try to get small sell quote: token -> USDC (to ensure sell path exists)
+     - Try to get a larger buy quote to estimate liquidity (USDC -> token)
+     - If no route or amount extremely small, mark as bad
+    Returns True if looks ok (not honeypot / has some liquidity)
+    """
+    USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # mainnet USDC
+    # estimate decimals
+    dec = get_token_decimals(token_mint) or 9
+    # attempt a tiny sell: 1 token unit
+    tiny_amount = 1 * (10 ** dec)
+    sell_quote = jupiter_quote(token_mint, USDC_MINT, tiny_amount)
+    if not sell_quote:
+        print("Honeypot check: no sell route found (likely honeypot or no liquidity).")
+        return False
+    # check route result has output amount
+    data = sell_quote.get("data") or sell_quote.get("routes")
+    if not data:
+        print("Honeypot check: quote returned no routes.")
+        return False
+    # now check liquidity by requesting a larger buy: USDC -> token for e.g. $1000 (assuming USDC decimals 6)
+    usdc_dec = 6
+    large_usdc = int(MIN_LIQUIDITY_USD * (10 ** usdc_dec))
+    buy_quote = jupiter_quote(USDC_MINT, token_mint, large_usdc)
+    if not buy_quote:
+        print(f"Liquidity check failed: no buy route for ${MIN_LIQUIDITY_USD}.")
+        return False
+    # if routes exist, accept
+    print("Honeypot & liquidity quick-check PASSED.")
+    return True
+
+# ----------------- Signing & sending Jupiter swap transaction -----------------
+def sign_and_send_swap(swap_tx_base64: str) -> Optional[str]:
+    """
+    - Deserialize VersionedTransaction from base64 (unsigned)
+    - Sign with your private key (solders Keypair)
+    - Send via RPC 'sendTransaction' (base64 signed bytes)
+    Returns tx signature string on success
+    """
+    try:
+        unsigned = base64.b64decode(swap_tx_base64)
+        # VersionedTransaction.deserialize expects bytes; using solders VersionedTransaction
+        vt = VersionedTransaction.deserialize(unsigned)
+        if solders_kp is None:
+            raise RuntimeError("solders keypair not available to sign VersionedTransaction.")
+        # vt.sign takes iterable of Keypair (solders), but API can vary by solders version
+        try:
+            vt.sign([solders_kp])
+        except Exception as e:
+            # fallback attempt: older API names
+            try:
+                vt.signatures.append(Signature.default())
+            except Exception:
+                raise e
+        signed_bytes = bytes(vt.serialize())
+        signed_b64 = base64.b64encode(signed_bytes).decode()
+        # Send via sendTransaction RPC
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [signed_b64, {"skipPreflight": False, "preflightCommitment": "confirmed"}]
+        }
+        r = requests.post(RPC_HTTP, json=payload, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        if "result" in j:
+            print("Swap send RPC result:", j["result"])
+            return j["result"]
+        else:
+            print("Swap send error response:", j)
+            return None
+    except Exception as e:
+        print("Error signing/sending swap tx:", e)
+        return None
+
+# ----------------- High-level buy flow -----------------
+def buy_via_jupiter(input_mint: str, output_mint: str, amount_in_sol: float) -> Optional[str]:
+    """
+    Executes swap SOL -> token_mint via Jupiter quote+swap
+    input_mint for SOL on Jupiter is So1111... (wrapped SOL)
+    """
+    # Jupiter uses wrapped SOL mint as input when swapping SOL; use native SOL mint on Jupiter:
+    WSOL = "So11111111111111111111111111111111111111112"
+    # convert SOL to lamports for WSOL 10**9
+    amt_raw = int(amount_in_sol * (10 ** 9))
+    print("Requesting Jupiter quote for buy...")
+    q = jupiter_quote(WSOL, output_mint, amt_raw)
+    if not q:
+        print("Quote failed for buy.")
+        return None
+    routes = q.get("data") or q.get("routes")
+    if not routes:
+        print("No route found in buy quote.")
+        return None
+    # create swap
+    print("Creating swap transaction via Jupiter...")
+    payload = {"route": routes[0], "userPublicKey": PUBLIC_KEY, "wrapUnwrapSOL": True}
+    r = requests.post(JUPITER_SWAP, json=payload, timeout=15)
+    if r.status_code != 200:
+        print("Jupiter swap creation failed:", r.text)
+        return None
+    swap_resp = r.json()
+    swap_tx = swap_resp.get("swapTransaction") or swap_resp.get("swapTransactionBase64")
+    if not swap_tx:
+        print("Jupiter swap response missing transaction.")
+        return None
+    # sign & send
+    print("Signing & sending swap transaction...")
+    sig = sign_and_send_swap(swap_tx)
+    if sig:
+        print(f"Buy tx sent: {sig}")
+    return sig
+
+# ----------------- High-level sell flow (token -> SOL or USDC) -----------------
+def sell_via_jupiter(input_mint: str, output_mint: str, amount_raw: int) -> Optional[str]:
+    """
+    Sell token -> USDC or SOL using Jupiter (amount_raw in token smallest units).
+    """
+    print("Requesting Jupiter quote for sell...")
+    q = jupiter_quote(input_mint, output_mint, amount_raw)
+    if not q:
+        print("Quote failed for sell.")
+        return None
+    routes = q.get("data") or q.get("routes")
+    if not routes:
+        print("No route found in sell quote.")
+        return None
+    print("Creating swap transaction for sell...")
+    payload = {"route": routes[0], "userPublicKey": PUBLIC_KEY, "wrapUnwrapSOL": True}
+    r = requests.post(JUPITER_SWAP, json=payload, timeout=15)
+    if r.status_code != 200:
+        print("Jupiter swap creation failed (sell):", r.text)
+        return None
+    swap_resp = r.json()
+    swap_tx = swap_resp.get("swapTransaction") or swap_resp.get("swapTransactionBase64")
+    if not swap_tx:
+        print("Swap response missing tx for sell.")
+        return None
+    print("Signing & sending sell transaction...")
+    sig = sign_and_send_swap(swap_tx)
+    if sig:
+        print(f"Sell tx sent: {sig}")
+    return sig
+
+# ----------------- Simple price monitoring (uses Jupiter quotes for estimate) -----------------
+async def monitor_and_autosell(token_mint: str, bought_amount_token_raw: int, buy_price_usd_est: float):
+    """
+    Monitors token via periodic Jupiter quotes and sells when TP/SL triggered.
+    Note: this is an estimate — better approach is onchain price feed or Serum orderbook analysis.
+    """
+    USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    dec = get_token_decimals(token_mint) or 9
+    token_per_unit = 1 * (10 ** dec)
+    print(f"Started monitor for {token_mint} ... (decimals={dec})")
+    # compute buy price per token in USD approx by asking Jupiter how many USDC for bought token
+    # We already had buy_price_usd_est passed or can try to compute here.
+    while True:
+        # get quote token -> USDC for 1 token unit
+        try:
+            q = jupiter_quote(token_mint, USDC, token_per_unit)
+            if q and (q.get("data") or q.get("routes")):
+                # parse estimated output in USDC from first route
+                route = (q.get("data") or q.get("routes"))[0]
+                out_amount = route.get("outAmount") or route.get("outAmountFormatted")
+                # outAmount is string of raw units; convert using USDC decimals (6)
+                # route may also include 'outAmount' numeric in string
+                out_amount_int = int(out_amount)
+                usdc_dec = 6
+                price_usd = out_amount_int / (10 ** usdc_dec)
+                # compute percent change relative to buy_price_usd_est (approx)
+                if buy_price_usd_est > 0:
+                    pct = (price_usd - buy_price_usd_est) / buy_price_usd_est * 100
+                    print(f"[monitor] token price estimate ${price_usd:.6f} ({pct:.2f}%)")
+                    if pct >= TAKE_PROFIT_PCT:
+                        print("Take profit reached — selling...")
+                        await asyncio.to_thread(sell_via_jupiter, token_mint, "So11111111111111111111111111111111111111112", bought_amount_token_raw)
+                        return
+                    if pct <= -STOP_LOSS_PCT:
+                        print("Stop loss reached — selling...")
+                        await asyncio.to_thread(sell_via_jupiter, token_mint, "So11111111111111111111111111111111111111112", bought_amount_token_raw)
+                        return
+        except Exception as e:
+            print("Monitor error:", e)
+        await asyncio.sleep(8)  # poll every 8 seconds
+
+# ----------------- Listener + orchestrator -----------------
+async def main_listener():
+    async_client = AsyncClient(RPC_HTTP)
+    async with ws_connect(RPC_WS) as ws:
+        await ws.logs_subscribe(filter={"mentions": [str(PUMP_FACTORY_ACCOUNT)]})
+        print("Listening for Pump.fun factory mentions...")
+        while True:
+            msg = await ws.recv()
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+            result = data.get("params", {}).get("result", {})
+            sig = result.get("signature")
+            if not sig:
+                continue
+            print("New tx sig:", sig)
+            # try to extract minted token
+            token_mint = try_extract_mint_from_signature(sig)
+            if not token_mint:
+                print("Could not auto-extract token mint from tx. Skipping this tx.")
+                continue
+            print("Detected token mint:", token_mint)
+            # run honeypot/liquidity quick-check
+            ok = honeypot_and_liquidity_check(token_mint)
+            if not ok:
+                print("Token failed honeypot/liquidity checks — skipping.")
+                continue
+            # proceed to buy via Jupiter
+            print("Proceeding to buy via Jupiter...")
+            buy_sig = await asyncio.to_thread(buy_via_jupiter, "So11111111111111111111111111111111111111112", token_mint, BUY_AMOUNT_SOL)
+            if not buy_sig:
+                print("Buy failed or not sent.")
+                continue
+            # Optionally: estimate bought token amount to start monitoring.
+            # We'll attempt to fetch token amount via getTransaction result
+            await asyncio.sleep(3)
+            txinfo = solana_rpc("getTransaction", [buy_sig, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+            try:
+                # try to read postTokenBalances from txinfo
+                post = txinfo.get("result", {}).get("meta", {}).get("postTokenBalances", []) or []
+                if post:
+                    # find entries for our token mint
+                    for p in post:
+                        if p.get("mint") == token_mint:
+                            ui_amount = float(p.get("uiTokenAmount", {}).get("uiAmountString") or 0)
+                            decimals = int(p.get("uiTokenAmount", {}).get("decimals") or 9)
+                            raw_amt = int(ui_amount * (10 ** decimals))
+                            # estimate buy price in USD by fetching token->USDC quote for raw_amt
+                            usdc_quote = jupiter_quote(token_mint, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", raw_amt)
+                            buy_price_usd_est = 0.0
+                            if usdc_quote and (usdc_quote.get("data") or usdc_quote.get("routes")):
+                                route = (usdc_quote.get("data") or usdc_quote.get("routes"))[0]
+                                out_amount = int(route.get("outAmount") or 0)
+                                buy_price_usd_est = out_amount / (10 ** 6)  # USDC decimals
+                                # price per token:
+                                if raw_amt > 0:
+                                    buy_price_usd_est = buy_price_usd_est / (raw_amt / (10 ** decimals))
+                            else:
+                                buy_price_usd_est = 0.0
+                            print(f"Bought approx {ui_amount} tokens (raw {raw_amt}), est buy price per token ${buy_price_usd_est:.6f}")
+                            # start monitor
+                            asyncio.create_task(monitor_and_autosell(token_mint, raw_amt, buy_price_usd_est))
+                            break
+                else:
+                    print("Couldn't find postTokenBalances in buy tx; starting monitor with unknown amounts.")
+                    asyncio.create_task(monitor_and_autosell(token_mint, 1, 0.0))
+            except Exception as e:
+                print("Error parsing buy tx for amounts:", e)
+                asyncio.create_task(monitor_and_autosell(token_mint, 1, 0.0))
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_listener())
+    except KeyboardInterrupt:
+        print("Exiting...")
